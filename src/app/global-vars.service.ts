@@ -2,6 +2,7 @@ import { Injectable } from "@angular/core";
 import {
   BackendApiService,
   BalanceEntryResponse,
+  DeSoNode,
   PostEntryResponse,
   TransactionFee,
   TutorialStatus,
@@ -19,7 +20,7 @@ import { AmplitudeClient } from "amplitude-js";
 import { DomSanitizer } from "@angular/platform-browser";
 import { IdentityService } from "./identity.service";
 import { BithuntService, CommunityProject } from "../lib/services/bithunt/bithunt-service";
-import { LeaderboardResponse, PulseService } from "../lib/services/pulse/pulse-service";
+import { LeaderboardResponse, AltumbaseService } from "../lib/services/altumbase/altumbase-service";
 import { RightBarCreatorsLeaderboardComponent } from "./right-bar-creators/right-bar-creators-leaderboard/right-bar-creators-leaderboard.component";
 import { HttpClient } from "@angular/common/http";
 import { FeedComponent } from "./feed/feed.component";
@@ -98,6 +99,7 @@ export class GlobalVarsService {
   messagesRequestsFollowedOnly = false;
 
   // Whether or not to show processing spinners in the UI for unmined transactions.
+  // TODO: Move into environment.ts
   showProcessingSpinners = false;
 
   rightBarLeaderboard = [];
@@ -115,7 +117,7 @@ export class GlobalVarsService {
   TutorialStatus: TutorialStatus;
 
   // map[pubkey]->bool of globomods
-  globoMods: any;
+  paramUpdaters: { [k: string]: boolean };
   feeRateDeSoPerKB = 1000 / 1e9;
   postsToShow = [];
   followFeedPosts = [];
@@ -211,6 +213,7 @@ export class GlobalVarsService {
   profileUpdateTimestamp: number;
 
   jumioDeSoNanos = 0;
+  jumioUSDCents = 0;
 
   referralUSDCents: number = 0;
 
@@ -219,6 +222,8 @@ export class GlobalVarsService {
   transactionFeeInfo: string;
 
   buyETHAddress: string = "";
+
+  nodes: { [id: number]: DeSoNode };
 
   SetupMessages() {
     // If there's no loggedInUser, we set the notification count to zero
@@ -320,14 +325,16 @@ export class GlobalVarsService {
     this.loggedInUser = user;
 
     // Fetch referralLinks for the userList before completing the load.
-    this.backendApi.GetReferralInfoForUser(this.localNode, this.loggedInUser.PublicKeyBase58Check).subscribe(
-      (res: any) => {
-        this.loggedInUser.ReferralInfoResponses = res.ReferralInfoResponses;
-      },
-      (err: any) => {
-        console.log(err);
-      }
-    );
+    this.backendApi
+      .GetReferralInfoForUser(environment.verificationEndpointHostname, this.loggedInUser.PublicKeyBase58Check)
+      .subscribe(
+        (res: any) => {
+          this.loggedInUser.ReferralInfoResponses = res.ReferralInfoResponses;
+        },
+        (err: any) => {
+          console.log(err);
+        }
+      );
 
     // If Jumio callback hasn't returned yet, we need to poll to update the user metadata.
     if (user && user?.JumioFinishedTime > 0 && !user?.JumioReturned) {
@@ -710,25 +717,22 @@ export class GlobalVarsService {
     });
   }
 
-  _alertError(err: any, showBuyDeSo: boolean = false, showBuyCreatorCoin: boolean = false) {
+  _alertError(err: any, showBuyCreatorCoin: boolean = false) {
     SwalHelper.fire({
       target: this.getTargetComponentSelector(),
       icon: "error",
       title: `Oops...`,
       html: err,
       showConfirmButton: true,
-      showCancelButton: showBuyDeSo || showBuyCreatorCoin,
+      showCancelButton: showBuyCreatorCoin,
       focusConfirm: true,
       customClass: {
         confirmButton: "btn btn-light",
         cancelButton: "btn btn-light no",
       },
-      confirmButtonText: showBuyDeSo ? "Buy DeSo" : showBuyCreatorCoin ? "Buy Creator Coin" : "Ok",
+      confirmButtonText: showBuyCreatorCoin ? "Buy Creator Coin" : "Ok",
       reverseButtons: true,
     }).then((res) => {
-      if (showBuyDeSo && res.isConfirmed) {
-        this.router.navigate([RouteNames.BUY_DESO], { queryParamsHandling: "merge" });
-      }
       if (showBuyCreatorCoin && res.isConfirmed) {
         this.router.navigate([RouteNames.CREATORS]);
       }
@@ -934,13 +938,13 @@ export class GlobalVarsService {
   }
 
   updateLeaderboard(forceRefresh: boolean = false): void {
-    const pulseService = new PulseService(this.httpClient, this.backendApi, this);
-
+    const altumbaseService = new AltumbaseService(this.httpClient, this.backendApi, this);
     if (this.topGainerLeaderboard.length === 0 || forceRefresh) {
-      pulseService.getDeSoLockedLeaderboard().subscribe((res) => (this.topGainerLeaderboard = res));
+      altumbaseService.getDeSoLockedLeaderboard().subscribe((res) => (this.topGainerLeaderboard = res));
     }
+
     if (this.topDiamondedLeaderboard.length === 0 || forceRefresh) {
-      pulseService.getDiamondsReceivedLeaderboard().subscribe((res) => (this.topDiamondedLeaderboard = res));
+      altumbaseService.getDiamondsReceivedLeaderboard().subscribe((res) => (this.topDiamondedLeaderboard = res));
     }
 
     if (this.topCommunityProjectsLeaderboard.length === 0 || forceRefresh) {
@@ -1130,7 +1134,7 @@ export class GlobalVarsService {
         return;
       }
       this.backendApi
-        .GetJumioStatusForPublicKey(environment.jumioEndpointHostname, publicKey)
+        .GetJumioStatusForPublicKey(environment.verificationEndpointHostname, publicKey)
         .subscribe(
           (res: any) => {
             if (res.JumioVerified) {
@@ -1171,21 +1175,26 @@ export class GlobalVarsService {
   getFreeDESOMessage(): string {
     return this.referralUSDCents
       ? this.formatUSD(this.referralUSDCents / 100, 0)
-      : this.nanosToUSD(this.jumioDeSoNanos, 0);
+      : this.formatUSD(this.jumioUSDCents / 100, 0);
   }
 
   getReferralUSDCents(): void {
     const referralHash = localStorage.getItem("referralCode");
     if (referralHash) {
       this.backendApi
-        .GetReferralInfoForReferralHash(environment.jumioEndpointHostname, referralHash)
+        .GetReferralInfoForReferralHash(environment.verificationEndpointHostname, referralHash)
         .subscribe((res) => {
           const referralInfo = res.ReferralInfoResponse.Info;
-          if (
+          const countrySignUpBonus = res.CountrySignUpBonus;
+          if (!countrySignUpBonus.AllowCustomReferralAmount) {
+            this.referralUSDCents = countrySignUpBonus.ReferralAmountOverrideUSDCents;
+          } else if (
             res.ReferralInfoResponse.IsActive &&
             (referralInfo.TotalReferrals < referralInfo.MaxReferrals || referralInfo.MaxReferrals == 0)
           ) {
             this.referralUSDCents = referralInfo.RefereeAmountUSDCents;
+          } else {
+            this.referralUSDCents = countrySignUpBonus.ReferralAmountOverrideUSDCents;
           }
         });
     }

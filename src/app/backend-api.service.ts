@@ -3,8 +3,8 @@
 // get the browser to save the cookie in the response.
 // https://github.com/github/fetch#sending-cookies
 import { Injectable } from "@angular/core";
-import { Observable, of, throwError } from "rxjs";
-import { map, mergeMap, switchMap, catchError, mapTo } from "rxjs/operators";
+import { interval, Observable, of, throwError, zip } from "rxjs";
+import { map, switchMap, catchError, filter, take, concatMap } from "rxjs/operators";
 import { HttpClient, HttpErrorResponse } from "@angular/common/http";
 import { IdentityService } from "./identity.service";
 import { environment } from "src/environments/environment";
@@ -54,10 +54,14 @@ export class BackendRoutes {
   static RoutePathGetRepostsForPost = "/api/v0/get-reposts-for-post";
   static RoutePathGetQuoteRepostsForPost = "/api/v0/get-quote-reposts-for-post";
   static RoutePathGetJumioStatusForPublicKey = "/api/v0/get-jumio-status-for-public-key";
+  static RoutePathGetUserMetadata = "/api/v0/get-user-metadata";
 
   // Verify
   static RoutePathVerifyEmail = "/api/v0/verify-email";
   static RoutePathResendVerifyEmail = "/api/v0/resend-verify-email";
+
+  // Delete PII
+  static RoutePathDeletePII = "/api/v0/delete-pii";
 
   // Tutorial
   static RoutePathStartOrSkipTutorial = "/api/v0/start-or-skip-tutorial";
@@ -118,6 +122,10 @@ export class BackendRoutes {
   static RoutePathAdminResetTutorialStatus = "/api/v0/admin/reset-tutorial-status";
   static RoutePathAdminGetTutorialCreators = "/api/v0/admin/get-tutorial-creators";
   static RoutePathAdminJumioCallback = "/api/v0/admin/jumio-callback";
+  static RoutePathAdminGetAllCountryLevelSignUpBonuses = "/api/v0/admin/get-all-country-level-sign-up-bonuses";
+  static RoutePathAdminUpdateJumioCountrySignUpBonus = "/api/v0/admin/update-jumio-country-sign-up-bonus";
+  static RoutePathAdminUpdateJumioUSDCents = "/api/v0/admin/update-jumio-usd-cents";
+  static RoutePathAdminUpdateJumioKickbackUSDCents = "/api/v0/admin/update-jumio-kickback-usd-cents";
 
   // Referral program admin routes.
   static RoutePathAdminCreateReferralHash = "/api/v0/admin/create-referral-hash";
@@ -142,6 +150,10 @@ export class BackendRoutes {
   static RoutePathAdminGetTransactionFeeMap = "/api/v0/admin/get-transaction-fee-map";
   static RoutePathAdminAddExemptPublicKey = "/api/v0/admin/add-exempt-public-key";
   static RoutePathAdminGetExemptPublicKeys = "/api/v0/admin/get-exempt-public-keys";
+
+  // Supply Monitoring endpoints
+  static RoutePathGetTotalSupply = "/api/v0/total-supply";
+  static RoutePathGetRichList = "/api/v0/rich-list";
 }
 
 export class Transaction {
@@ -370,6 +382,55 @@ export class TransactionFee {
   ProfileEntryResponse?: ProfileEntryResponse;
 }
 
+export class DeSoNode {
+  Name: string;
+  URL: string;
+  Owner: string;
+}
+
+type GetUserMetadataResponse = {
+  HasPhoneNumber: boolean;
+  CanCreateProfile: boolean;
+  BlockedPubKeys: { [k: string]: any };
+  HasEmail: boolean;
+  EmailVerified: boolean;
+  JumioFinishedTime: number;
+  JumioVerified: boolean;
+  JumioReturned: boolean;
+};
+
+type GetUsersStatelessResponse = {
+  UserList: User[];
+  DefaultFeeRateNanosPerKB: number;
+  ParamUpdaters: { [k: string]: boolean };
+};
+
+export type RichListEntryResponse = {
+  PublicKeyBase58Check: string;
+  BalanceNanos: number;
+  BalanceDESO: number;
+  Percentage: number;
+  Value: number;
+};
+
+export type CountryLevelSignUpBonus = {
+  AllowCustomReferralAmount: boolean;
+  ReferralAmountOverrideUSDCents: number;
+  AllowCustomKickbackAmount: boolean;
+  KickbackAmountOverrideUSDCents: number;
+};
+
+export type CountryCodeDetails = {
+  Name: string;
+  CountryCode: string;
+  Alpha3: string;
+};
+
+export type CountryLevelSignUpBonusResponse = {
+  CountryLevelSignUpBonus: CountryLevelSignUpBonus;
+  CountryCodeDetails: CountryCodeDetails;
+};
+
 @Injectable({
   providedIn: "root",
 })
@@ -388,16 +449,16 @@ export class BackendApiService {
   MessageMetaKey = "messageMetaKey";
 
   // Store the identity users in localStorage
-  IdentityUsersKey = "identityUsers";
+  IdentityUsersKey = "identityUsersV2";
 
   // Store last local node URL in localStorage
   LastLocalNodeKey = "lastLocalNodeV2";
 
   // Store last logged in user public key in localStorage
-  LastLoggedInUserKey = "lastLoggedInUser";
+  LastLoggedInUserKey = "lastLoggedInUserV2";
 
   // Store the last identity service URL in localStorage
-  LastIdentityServiceKey = "lastIdentityServiceURL";
+  LastIdentityServiceKey = "lastIdentityServiceURLV2";
 
   // TODO: Wipe all this data when transition is complete
   LegacyUserListKey = "userList";
@@ -695,9 +756,13 @@ export class BackendApiService {
   }
 
   // User-related functions.
-  GetUsersStateless(endpoint: string, publicKeys: any[], SkipForLeaderboard: boolean = false): Observable<any> {
+  GetUsersStateless(
+    endpoint: string,
+    PublicKeysBase58Check: string[],
+    SkipForLeaderboard: boolean = false
+  ): Observable<GetUsersStatelessResponse> {
     return this.post(endpoint, BackendRoutes.GetUsersStatelessRoute, {
-      PublicKeysBase58Check: publicKeys,
+      PublicKeysBase58Check,
       SkipForLeaderboard,
     });
   }
@@ -1220,7 +1285,22 @@ export class BackendApiService {
       NewStakeMultipleBasisPoints,
       IsHidden,
       MinFeeRateNanosPerKB,
-    });
+    }).pipe(
+      switchMap((res) => {
+        // We need to wait until the profile creation has been comped.
+        if (res.CompProfileCreationTxnHashHex) {
+          return interval(500)
+            .pipe(
+              concatMap((iteration) => zip(this.GetTxn(endpoint, res.CompProfileCreationTxnHashHex), of(iteration)))
+            )
+            .pipe(filter(([txFound, iteration]) => txFound.TxnFound || iteration > 120))
+            .pipe(take(1))
+            .pipe(switchMap(() => of(res)));
+        } else {
+          return of(res);
+        }
+      })
+    );
 
     return this.signAndSubmitTransaction(endpoint, request, UpdaterPublicKeyBase58Check);
   }
@@ -1286,18 +1366,14 @@ export class BackendApiService {
       map((res) => {
         // This array contains encrypted messages with public keys
         // Public keys of the other party involved in the correspondence
-        const encryptedMessages = [];
-        for (const threads of res.OrderedContactsWithMessages) {
-          for (const message of threads.Messages) {
-            const payload = {
-              EncryptedHex: message.EncryptedText,
-              PublicKey: message.IsSender ? message.RecipientPublicKeyBase58Check : message.SenderPublicKeyBase58Check,
-              IsSender: message.IsSender,
-              Legacy: !message.V2,
-            };
-            encryptedMessages.push(payload);
-          }
-        }
+        const encryptedMessages = res.OrderedContactsWithMessages.flatMap((thread) =>
+          thread.Messages.flatMap((message) => ({
+            EncryptedHex: message.EncryptedText,
+            PublicKey: message.IsSender ? message.RecipientPublicKeyBase58Check : message.SenderPublicKeyBase58Check,
+            IsSender: message.IsSender,
+            Legacy: !message.V2,
+          }))
+        );
         return { ...res, encryptedMessages };
       })
     );
@@ -1312,12 +1388,11 @@ export class BackendApiService {
           })
           .pipe(
             map((decrypted) => {
-              for (const threads of res.OrderedContactsWithMessages) {
-                for (const message of threads.Messages) {
-                  message.DecryptedText = decrypted.decryptedHexes[message.EncryptedText];
-                }
-              }
-
+              res.OrderedContactsWithMessages.forEach((threads) =>
+                threads.Messages.forEach(
+                  (message) => (message.DecryptedText = decrypted.decryptedHexes[message.EncryptedText])
+                )
+              );
               return { ...res, ...decrypted };
             })
           );
@@ -1610,6 +1685,16 @@ export class BackendApiService {
       PublicKey,
       EmailHash,
     });
+  }
+
+  DeletePII(endpoint: string, PublicKeyBase58Check: string): Observable<any> {
+    return this.jwtPost(endpoint, BackendRoutes.RoutePathDeletePII, PublicKeyBase58Check, {
+      PublicKeyBase58Check,
+    });
+  }
+
+  GetUserMetadata(endpoint: string, PublicKeyBase58Check: string): Observable<GetUserMetadataResponse> {
+    return this.get(endpoint, BackendRoutes.RoutePathGetUserMetadata + "/" + PublicKeyBase58Check);
   }
 
   GetJumioStatusForPublicKey(endpoint: string, PublicKeyBase58Check: string): Observable<any> {
@@ -1933,16 +2018,57 @@ export class BackendApiService {
     });
   }
 
+  AdminUpdateJumioUSDCents(endpoint: string, AdminPublicKey: string, USDCents: number): Observable<any> {
+    return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminUpdateJumioUSDCents, AdminPublicKey, {
+      AdminPublicKey,
+      USDCents,
+    });
+  }
+
+  AdminUpdateJumioKickbackUSDCents(endpoint: string, AdminPublicKey: string, USDCents: number): Observable<any> {
+    return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminUpdateJumioKickbackUSDCents, AdminPublicKey, {
+      AdminPublicKey,
+      USDCents,
+    });
+  }
+
   AdminJumioCallback(
     endpoint: string,
     AdminPublicKey: string,
     PublicKeyBase58Check: string,
-    Username: string
+    Username: string,
+    CountryAlpha3: string = ""
   ): Observable<any> {
     return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminJumioCallback, AdminPublicKey, {
       PublicKeyBase58Check,
       Username,
       AdminPublicKey,
+      CountryAlpha3,
+    });
+  }
+
+  AdminGetAllCountryLevelSignUpBonuses(
+    endpoint: string,
+    AdminPublicKey: string
+  ): Observable<{
+    SignUpBonusMetadata: { [k: string]: CountryLevelSignUpBonusResponse };
+    DefaultSignUpBonusMetadata: CountryLevelSignUpBonus;
+  }> {
+    return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminGetAllCountryLevelSignUpBonuses, AdminPublicKey, {
+      AdminPublicKey,
+    });
+  }
+
+  AdminUpdateJumioCountrySignUpBonus(
+    endpoint: string,
+    AdminPublicKey: string,
+    CountryCode: string,
+    CountryLevelSignUpBonus: CountryLevelSignUpBonus
+  ): Observable<any> {
+    return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminUpdateJumioCountrySignUpBonus, AdminPublicKey, {
+      AdminPublicKey,
+      CountryCode,
+      CountryLevelSignUpBonus,
     });
   }
 
@@ -2007,11 +2133,20 @@ export class BackendApiService {
     });
   }
 
-  AdminUploadReferralCSV(endpoint: string, AdminPublicKey: string, CSVRows: Array<Array<String>>): Observable<any> {
-    return this.jwtPost(endpoint, BackendRoutes.RoutePathAdminUploadReferralCSV, AdminPublicKey, {
-      AdminPublicKey,
-      CSVRows,
+  AdminUploadReferralCSV(endpoint: string, AdminPublicKey: string, file: File): Observable<any> {
+    const request = this.identityService.jwt({
+      ...this.identityService.identityServiceParamsForKey(AdminPublicKey),
     });
+    return request.pipe(
+      switchMap((signed) => {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("UserPublicKeyBase58Check", AdminPublicKey);
+        formData.append("JWT", signed.jwt);
+
+        return this.post(endpoint, BackendRoutes.RoutePathAdminUploadReferralCSV, formData);
+      })
+    );
   }
 
   GetReferralInfoForUser(endpoint: string, PublicKeyBase58Check: string): Observable<any> {
@@ -2020,7 +2155,10 @@ export class BackendApiService {
     });
   }
 
-  GetReferralInfoForReferralHash(endpoint: string, ReferralHash: string): Observable<any> {
+  GetReferralInfoForReferralHash(
+    endpoint: string,
+    ReferralHash: string
+  ): Observable<{ ReferralInfoResponse: any; CountrySignUpBonus: CountryLevelSignUpBonus }> {
     return this.post(endpoint, BackendRoutes.RoutePathGetReferralInfoForReferralHash, {
       ReferralHash,
     });
@@ -2171,6 +2309,14 @@ export class BackendApiService {
 
   GetVideoStatus(endpoint: string, videoId: string): Observable<any> {
     return this.get(endpoint, `${BackendRoutes.RoutePathGetVideoStatus}/${videoId}`);
+  }
+
+  GetTotalSupply(endpoint: string): Observable<number> {
+    return this.get(endpoint, BackendRoutes.RoutePathGetTotalSupply);
+  }
+
+  GetRichList(endpoint: string): Observable<RichListEntryResponse[]> {
+    return this.get(endpoint, BackendRoutes.RoutePathGetRichList);
   }
 
   // Error parsing
